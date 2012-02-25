@@ -8,8 +8,8 @@ class Job(object):
     Base class of the jOB
     """
         
-    def map(self, pos, item):
-        return (pos, item)
+    def map(self, pos, item, cb):
+        cb (item)
     
     def reduce_start(self):
         pass
@@ -42,8 +42,8 @@ class WC(Job):
     def enumerate(self):
         return enumerate(open(self.file))
         
-    def map(self, pos, item):
-        return (pos, (1, len(item.split()), len(item)))
+    def map(self, pos, item, cb):
+        cb((pos, (1, len(item.split()), len(item))))
         
     def reduce_value(self, r):
         (lc, wc, bc) = r
@@ -154,7 +154,7 @@ class Runner(object):
         """
         try:
             for i, item in iter(self.inq.get, self.STOP_MSG):
-                self.outq.put( self.job.map(i, item) )
+                self.job.map(i, item, self.outq.put)
         except:
             except_type, except_class, tb = sys.exc_info()
             self.exc.put((except_type, except_class, traceback.extract_tb(tb)))
