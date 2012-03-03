@@ -1,15 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-import multiprocessing, sys, traceback
+import multiprocessing, sys, cPickle, os, datetime
+from multiprocessing.queues import SimpleQueue
+from tempfile import NamedTemporaryFile, TemporaryFile
+import heapq, itertools
 
 class Job(object):
     """
-    Base class of the jOB
+    Base class of the Job.
+    
+    job.enumerate() should return an interator over ITEMS
+    
+    for each INPUT
+        job.map(item, cb) is called 
+        cb should be called for each key-value pair
+        
+    all key values pairs are sorted, and for each key
+        job.reduce_key_start(key) is called
+        job.reduce_value(value) is called
+        job.reduce_key_stop(key) is called        
     """
         
-    def map(self, pos, item):
-        return (pos, item)
+    def map(self, item, cb):
+        cb (item)
     
     def reduce_start(self):
         pass
@@ -42,8 +56,9 @@ class WC(Job):
     def enumerate(self):
         return enumerate(open(self.file))
         
-    def map(self, pos, item):
-        return (pos, (1, len(item.split()), len(item)))
+    def map(self, item, cb):
+        (pos, line) = item
+        cb((pos, (1, len(line.split()), len(line))))
         
     def reduce_value(self, r):
         (lc, wc, bc) = r
@@ -54,162 +69,180 @@ class WC(Job):
     def reduce_stop(self):
         return (self.lc, self.wc, self.bc)
 
-class Runner(object):
-    """
-    simplemapreduce.Runner wraps up an single-server multi-core of MapReduce
-    
-    job.enumerate() is called and should returns an enumeration of elements
-    
-    job.map(i, elt) is called on a separate subprocess for each element. 
-        i is the position of the element in the original enumeraiton
-        job.map should return a tuple (key, value), where key is an integer.
-        key can be None is the order of values is meaningless
-    
-    job.onReduceStart() is called in the parent process at the begin of reduce processing
-    
-    job.reduce(key, value) is called on each element in the parent process, in the order of keys
-    
-    job.onReduceStop() is called in the parent process at the end of reduce processing        
-    """ 
+def debug_print(s):
+    print >> sys.stderr, "[%s] (pid %u) %s" % (datetime.datetime.now().strftime('%H:%M:%S'),  os.getpid(), s)
+
+class BaseRunner(object):
     STOP_MSG = "##STOP_MSG##"
-    
-    UNIQUE_INTEGER_KEY = "UNIQUE_INTEGER_KEY"
-    
-    MULTIKEY_RAMBASED = "MULTIKEY_RAMBASED"
-    
-    
-    def __init__(self, mode, numprocs = None, debug=False, ):
-        self.numprocs = numprocs
-        if not self.numprocs:
-            self.numprocs = multiprocessing.cpu_count()
-
-        self.inq = multiprocessing.Queue()
-        self.outq = multiprocessing.Queue()
-        self.exc = multiprocessing.Queue()
-        self.debug = debug
-        self.mode = mode
-        
+    def __init__(self):
+        self.debug = False
+        pass
+    def reduce_loop(self, item_iterator):
+        job = self.job
+        job.reduce_start()
+        pkey = None
+        for (key, val) in item_iterator:
+            if pkey == None or pkey != key:
+                if not (pkey is None):
+                    job.reduce_key_stop(pkey)
+                job.reduce_key_start(key)
+                pkey = key
+            job.reduce_value(val)
+        if not (pkey is None):
+            job.reduce_key_stop(pkey)
+        return job.reduce_stop()
+       
+class SingleThreadRunner(BaseRunner):
+    """
+    Runner that executes a job in a single thread on a single process
+    """
+    def __init__(self):
+        pass
     def run(self, job):
-        self.job = job
-
+        self.job = job 
+        buf = []
+        for elt in job.enumerate(): 
+            job.map(elt, buf.append)
+        buf.sort()
+        return self.reduce_loop(buf)
+        
+class BaseMultiprocessingRunner(BaseRunner):
+    def __init__(self):
+        super(BaseMultiprocessingRunner, self).__init__()
+        self.numprocs = max(multiprocessing.cpu_count() - 1, 1)
+        self.map_input_queue = SimpleQueue()
+        self.map_output_queue = SimpleQueue()
+    def run_map(self):
+          for item in iter(self.map_input_queue.get, self.STOP_MSG):
+              self.job.map(item, self.map_output_queue.put)
+          self.map_output_queue.put(self.STOP_MSG)
+          if self.debug:
+              debug_print("Output : STOP sent")        
+    def run_enumerate(self):
+        for inp in self.job.enumerate(): 
+            self.map_input_queue.put(inp)
+        for work in range(self.numprocs):
+            self.map_input_queue.put(self.STOP_MSG)
+        if self.debug: 
+            debug_print("Input: STOP sent")         
+    def run(self, job):
+        self.job = job 
         # Process that reads the input file
-        self.pin = multiprocessing.Process(target=self.enumerate_and_process_input, args=())
+        self.enumeration_process = multiprocessing.Process(target=self.run_enumerate, args=())
         
-        # Line Processes. 
-        self.ps = [ multiprocessing.Process(target=self.call_map, args=())
+        self.mappers = [ multiprocessing.Process(target=self.run_map, args=())
                         for i in range(self.numprocs)]
+                     
+        self.enumeration_process.start()
+        for mapper in self.mappers:
+            mapper.start()
+        r = self.run_reduce()
+        self.enumeration_process.join()
+        for mapper in self.mappers:
+            mapper.join()
+        return r 
 
-        if self.debug:
-            print "Starting the job with %u processoes" % self.numprocs
-
-        # Start the processes
-        self.pin.start()
-        for p in self.ps:
-            p.start()
-            
-        if self.mode == self.MULTIKEY_RAMBASED: 
-            ret = self.call_reduce_multikey_rambased()
-        elif self.mode == self.UNIQUE_INTEGER_KEY: 
-            ret = self.call_reduce_unique_integer_key()
-        else: 
-            raise Exception("Invalid mode %s" % self.mode)
-
-        # Join all processors. 
-        self.pin.join()
-        i = 0
-        for p in self.ps:
-            p.join()
-            if self.debug:
-                print >> sys.stderr, "Done", i
-            i += 1
-            
+class DiskBasedRunner(BaseMultiprocessingRunner):
+    def __init__(self, map_buffer_size = 10000, reduce_max_files = 10 ):
+        super(DiskBasedRunner, self).__init__()
+        self.item_buffer = {}
+        self.map_buffer_size = map_buffer_size
+        self.reduce_max_files = reduce_max_files
+        self.map_opened_files = []
         
+    def run_map(self):
+        self.item_buffer = []
+        for item in iter(self.map_input_queue.get, self.STOP_MSG):
+            self.job.map(item, self.item_buffer.append)
+            if len(self.item_buffer) > self.map_buffer_size: 
+                self.map_buffer_clear()
+        self.map_buffer_clear()
+        self.map_output_queue.put(self.STOP_MSG)
+        if self.debug:
+            debug_print("Map done")
+        
+    def map_buffer_clear(self):
+        self.item_buffer.sort()
+        f = NamedTemporaryFile() # We keep the file opened as it would close automatically 
+        if self.debug:
+            debug_print('Temp file %s' % f.name)
+        for item in self.item_buffer:
+            cPickle.dump(item, f, cPickle.HIGHEST_PROTOCOL)
+        f.flush()
+        self.map_opened_files.append(f)
+        self.map_output_queue.put(f.name)
+        del self.item_buffer[:]
+        
+    def get_next_file(self):
+        while self.stopped_received < self.numprocs:
+            filename = self.map_output_queue.get()
+            if filename == self.STOP_MSG:
+                self.stopped_received = self.stopped_received + 1 
+                if self.debug:
+                    debug_print("Reduced received complete output from %u mappers" % self.stopped_received)
+                continue
+            else: 
+                if self.debug: 
+                    debug_print('Reading %s' % filename)
+                yield open(filename, 'r')
+        if self.debug:
+            debug_print('All files from mappers received')
+        
+    def iter_on_file(self, stream):
         try:
             while True:
-                exc_info = self.exc.get(False)
-                print exc_info
-        except:
-            pass
+                yield cPickle.load(stream)
+        except EOFError:
+            stream.close()
+            if hasattr(stream, "name"): 
+                os.remove(stream.name) 
             
-        return ret
-
-    def enumerate_and_process_input(self):
-        """"
-        The data is then sent over inqueue for the workers to do their
-        thing.  At the end the input thread sends a 'STOP' message for each
-        worker.
-        """
-        for i, line in self.job.enumerate(): 
-            self.inq.put( (i, line))
-
-        for work in range(self.numprocs):
-            self.inq.put(self.STOP_MSG)
-        if self.debug: 
-            print >> sys.stderr, "Input: STOP sent "
-
-    
-    def call_map(self):
-        """
-        Read lines from input, call process_line for each, and performs output. 
-        """
-        try:
-            for i, item in iter(self.inq.get, self.STOP_MSG):
-                self.outq.put( self.job.map(i, item) )
-        except:
-            except_type, except_class, tb = sys.exc_info()
-            self.exc.put((except_type, except_class, traceback.extract_tb(tb)))
-
-        self.outq.put(self.STOP_MSG)
-        if self.debug:
-            print >> sys.stderr, "Output : STOP sent"
-            
-    def call_reduce_multikey_rambased(self):
-        """
-        Call call_output
-        """
-        self.job.reduce_start()
-        
-        buf = [] 
-        
-        for mappers in range(self.numprocs):
-            for msg in iter(self.outq.get, self.STOP_MSG):
-                buf.append(msg)
-        
-        buf.sort() 
-
-        pkey = None
-
-        for b in buf: 
-            (key, val) = b
-            if pkey is None:
-                self.job.reduce_key_start(key)
-                self.job.reduce_value(val)
-                pkey = key
-            elif pkey == key: 
-                self.job.reduce_value(val)
+    def run_reduce(self):
+        self.stopped_received = 0 
+        self.merged_files = []
+        merged_iterator = None
+        while True:
+            # Iterate and merge files until all jobs are processed
+            get_next = self.get_next_file()
+            files = get_next 
+            #itertools.islice(get_next, self.reduce_max_files)
+            all_files = [file for file in files]
+            iterables = [self.iter_on_file(file) for file in all_files]
+            merged_iterator = heapq.merge(*iterables)
+            if self.stopped_received < self.numprocs: 
+                if self.debug: 
+                    debug_print("Performing intermediate merge on %u  files" % len(iterables))
+                f = TemporaryFile()
+                self.merged_files.append(f)
+                for m in merged_iterator:
+                    cPickle.dump(m, f, cPickle.HIGHEST_PROTOCOL)
+                f.seek(0)
+                f.flush()
             else:
-                self.job.reduce_key_stop(pkey)
-                self.job.reduce_key_start(key)
-                pkey = key
-                self.job.reduce_value(val)
-        
-        if not (pkey is None): 
-            self.job.reduce_key_stop(pkey)  
-        
-        return self.job.reduce_stop()
-        
-    
-    def call_reduce_unique_integer_key(self):
-        """
-        Call call_output sequentially, respecting ordering of the initial file. 
-        """
+                break
+        if len(self.merged_files) > 0:
+            if self.debug:
+                debug_print("Final merge")
+            # Final merge if required
+            merged_iterator = heapq.merge(*([self.iter_on_file(stream) for stream in self.merged_files]+[merged_iterator]))
+        if self.debug:
+            debug_print("Reduce loop")
+        result = self.reduce_loop(merged_iterator) 
+        return result 
+            
+class SedLikeJobRunner(BaseMultiprocessingRunner):
+    """
+    Runner optimzed for jobs that outputs key values of the form (i, value) where i are consecutive integer
+    starting at '0'
+    """
+    def __init__(self):
+        super(SedLikeJobRunner, self).__init__()
+    def run_reduce(self):
         cur = 0
         buffer = {}
-        
         self.job.reduce_start()
-
         for mappers in range(self.numprocs):
-            for msg in iter(self.outq.get, self.STOP_MSG):
+            for msg in iter(self.map_output_queue.get, self.STOP_MSG):
                 (i, val)  = msg 
                 # verify rows are in order, if not save in buffer
                 if i != cur:
@@ -226,12 +259,46 @@ class Runner(object):
                         del buffer[cur]
                         cur += 1
             if self.debug:
-                print >> sys.stderr, "Mapper done %u" % mappers
+                debug_print("Mapper done %u" % mappers)
+        return self.job.reduce_stop()
+    
+class WCLikeJobRunner(BaseMultiprocessingRunner):
+    """
+    Runner optimized for jobs that outputs always the same key, and perform only a global reduce over all values
+    """
+    def __init__(self):
+        super(WCLikeJobRunner, self).__init__()
+        
+    def run_reduce(self):
+        self.job.reduce_start()
+        for mappers in range(self.numprocs):
+            for msg in iter(self.map_output_queue.get, self.STOP_MSG):
+                (key, val)  = msg 
+                self.job.reduce_value(val)
         return self.job.reduce_stop()
         
+class RambasedRunner(BaseMultiprocessingRunner):
+    def __init__(self):
+        super(RambasedRunner, self).__init__()
+
+    def run_reduce(self):
+        self.job.reduce_start()
+        buf = []
+        for mappers in range(self.numprocs):
+            for msg in iter(self.map_output_queue.get, self.STOP_MSG): 
+                buf.append(msg)
+        buf.sort()
+        return self.reduce_loop(buf)
+        
 if __name__ == "__main__":
-    runner = Runner(Runner.UNIQUE_INTEGER_KEY)
-    #runner = Runner(Runner.MULTIKEY_RAMBASED)
-    for argv in sys.argv[1:]:
-        (lc, wc, bc) = runner.run(WC(argv))
-        print "\t%u\t%u\t%u\t%s" % (lc, wc, bc, argv)
+    runners = []
+    runners.append(SingleThreadRunner())
+    runners.append(RambasedRunner())
+    runners.append(WCLikeJobRunner())
+    runners.append(SedLikeJobRunner())
+    runners.append(DiskBasedRunner())
+    for runner in runners:
+        runner.debug = True
+        for argv in sys.argv[1:]:
+            (lc, wc, bc) = runner.run(WC(argv))
+            print "(%s)\t%u\t%u\t%u\t%s" % (runner.__class__.__name__, lc, wc, bc, argv)
