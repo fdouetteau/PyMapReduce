@@ -9,15 +9,15 @@ except ImportError:
 
 setup(
     name = 'pymapreduce',
-    version = '0.1',
+    version = '0.2',
     url = 'https://github.com/fdouetteau/PyMapReduce',
     description = 'Simple Mapreduce in Python',
     author = 'Florian Douetteau',
     author_email = 'florian@douetteau.net',
     license = 'MIT',
     platforms = 'any',
+    packages = [ 'pymapreduce'], 
     py_modules = [
-        'pymapreduce'
     ],
     requires = [
     ],
